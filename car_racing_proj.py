@@ -178,74 +178,85 @@ class DQNAgent:
         # If the random number is greater than or equal to epsilon, choose the best action predicted by the online network.
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
 
-        
+        # Temporarily deactivate gradient calculations for efficiency
         with torch.no_grad():
             # Pass the state tensor through the online Q-network to get Q-values for all actions.
             q_values = self.q_network_online(state_tensor)
         return q_values.argmax().item()
     
+    # Stores a transition (experience) in the replay buffer.
     def store_transition(self, state, action, reward, next_state, done):
-        """Stocke une transition dans la mémoire."""
+        """ Stores a (s, a, r, s', done) transition in the replay buffer """
         self.memory.store(state, action, reward, next_state, done)
     
+    # Performs a single training step using a batch sampled from the replay buffer.
     def train_agent(self):
         """ Trains the agent by sampling a batch from the replay buffer """
 
-        # 1. If memorty has less than batch_size, do nothing
+        # If memorty has less than batch_size, do nothing
         if len(self.memory) < self.batch_size:
             return None # Not enough samples to train
 
-        # 2. Sample a batch of experiences from the replay buffer
+        # Sample a batch of experiences from the replay buffer
         states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
         
-        # 3. Convert data into torch tensors
+        # Convert data into torch tensors
         states = torch.FloatTensor(states).to(self.device)
-        actions = torch.LongTensor(actions).to(self.device)
+        actions = torch.LongTensor(actions).to(self.device) # We use LongTensor because the actions are discrete
         rewards = torch.FloatTensor(rewards).to(self.device)
         next_states = torch.FloatTensor(next_states).to(self.device)
         dones = torch.FloatTensor(dones).to(self.device)
         
-        # 4. Calculer les Q-values actuelles (Q(s, a))
-        # (utilise le réseau ONLINE)
+        # Q-Value calculation
+        # Calculate the Q-values for the sampled states using the ONLINE network
         current_q_values = self.q_network_online(states)
+        # Select ONLY the Q-values corresponding to the 'actions' actually taken in those states
         current_q = current_q_values.gather(1, actions.unsqueeze(1)).squeeze()
         
-        # 5. Calculer les Q-values cibles (target)
-        # (utilise le réseau TARGET)
+        # Calculate the target Q-values using the TARGET network
         with torch.no_grad():
-            # (Ici c'est DQN. Pour Double DQN comme code3, on utiliserait les deux réseaux)
+            # Get the Q-values for the 'next_states' from the TARGET network
             next_q_values_target = self.q_network_target(next_states)
+            # Find the maximum Q-value among all possible actions in each 'next_state'
             max_next_q = next_q_values_target.max(1)[0]
             
-            # Formule de Bellman
+            # Calculate the target Q-value using the Bellman equation
             target_q = rewards + (1 - dones) * self.gamma * max_next_q
 
-        # 6. Calculer la perte (Loss)
+        # Calculate the Mean Squared Error (MSE) loss between the predicted Q-values (current_q)
+        # and the calculated target Q-values (target_q).
         loss = self.criterion(current_q, target_q)
         
-        # 7. Optimiser le réseau ONLINE
+        # Optimize the online network
+        # Reset gradients from the previous step
         self.optimizer.zero_grad()
+        # Compute gradients of the loss with respect to the online network's parameters (Backpropagation).
         loss.backward()
+        # Update the online network's parameters using the computed gradients (Adam optimization step).
         self.optimizer.step()
         
-        # 8. Mettre à jour le réseau TARGET (si c'est le moment)
-        self.train_step_count += 1
-        if self.train_step_count % self.target_update_freq == 0:
-            self.update_target_network()
-            
-        return loss.item() # Retourne la valeur de la perte
+        # Target network update
+        self.train_step_count += 1 # Increment the training step counter
+        if self.train_step_count % self.target_update_freq == 0: # Check if it's time to update the target network.
+            self.update_target_network() # If yes, copy the weights from the online network to the target network.
+        return loss.item() # Return the computed loss value
 
+    # Copies the current weights from the online network to the target network.
+    # This is done periodically to keep the target Q-values stable.
     def update_target_network(self):
-        """Copie les poids du réseau online vers le réseau target."""
+        """ Copies weights from the online network to the target network """
         print("--- Mise à jour du Target Network ---")
+        # Overwrite the target network's parameters with the online network's current parameters
         self.q_network_target.load_state_dict(self.q_network_online.state_dict())
     
     def decay_epsilon(self):
-        """Diminue epsilon."""
+        """ Decreases epsilon according to the decay rate, but not below epsilon_min """
+
+        # Multiply epsilon by the decay factor, ensuring it doesn't go below the minimum threshold
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
     def save(self, filepath):
-        """Sauvegarde l'état complet de l'agent (modèle, optimizer, epsilon)."""
+        """ Saves the agent's state (online network weights, optimizer state, epsilon, step count) to a file """
         torch.save({
             'model_state_dict': self.q_network_online.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -255,9 +266,8 @@ class DQNAgent:
         print(f"Modèle sauvegardé sous : {filepath}")
 
     def load(self, filepath):
-        """Charge l'état complet de l'agent."""
+        """ Loads the agent's state from a file """
         
-        # S'assurer de charger sur le bon appareil (CPU ou GPU)
         if not torch.cuda.is_available():
             checkpoint = torch.load(filepath, map_location='cpu')
         else:
@@ -269,71 +279,82 @@ class DQNAgent:
         self.epsilon = checkpoint['epsilon']
         self.train_step_count = checkpoint['train_step_count']
         
-        self.q_network_online.eval() # Met le réseau en mode évaluation
-        self.q_network_target.eval() # Met le réseau en mode évaluation
+        self.q_network_online.eval() # Put online network into evaluation mode
+        self.q_network_target.eval() # Put target network into evaluation mode
         print(f"Modèle chargé depuis : {filepath}. Epsilon restauré à {self.epsilon:.3f}")
         
 def train_dqn(episodes=1000, render=False, learning_rate=1e-4, gamma=0.99,
               checkpoint_path=None, plot_save_path=None, resume=False):
-    """ Train a DQN agent in the CarRacing-v3 environment """
-    env = gym.make('CarRacing-v3', continuous=False, 
-                   render_mode='human' if render else None)
+    """ Train a DQN agent in the CarRacing-v3 environment with checkpointing and video recording """
+
+    # Creates the CarRacing environment instance using Gymnasium with discrete actions
+    env = gym.make('CarRacing-v3', continuous=False, render_mode='human' if render else None)
     
+    # Wraps the environment with our custom PreprocessWrapper
     env = PreprocessWrapper(env)
     
+    # Get the number of possible discrete actions from the environment's action space
     action_size = env.action_space.n
     
-    # Create the new DQN agent
+    # Create an instance of our DQNAgent class, passing the action size and hyperparameters
     agent = DQNAgent(action_size, 
                      learning_rate=learning_rate, 
                      discount_factor=gamma)
     
     start_episode = 0
-    rewards_per_episode = []
-    losses_per_episode = []
+    rewards_per_episode = [] # List to store the total reward collected in each episode
+    losses_per_episode = [] # List to store the average loss calculated in each episode
 
+    # Define paths for saving/loading reward and loss history
     rewards_path = f"{checkpoint_path}_rewards.npy" if checkpoint_path else None
     losses_path = f"{checkpoint_path}_losses.npy" if checkpoint_path else None
 
+    # Check if resuming is requested, a checkpoint path is provided, and the checkpoint file actually exists
     if resume and checkpoint_path and os.path.exists(checkpoint_path):
         try:
             print(f"Reprise depuis le checkpoint : {checkpoint_path}")
             agent.load(checkpoint_path)
             
-            # Charger les métriques sauvegardées
+            # Load saved metrics and number of past episodes done
             rewards_per_episode = list(np.load(rewards_path))
             losses_per_episode = list(np.load(losses_path))
-            start_episode = len(rewards_per_episode) # Repartir après le dernier épisode sauvegardé
+            start_episode = len(rewards_per_episode)
             
             print(f"Reprise à l'épisode {start_episode}. Epsilon actuel: {agent.epsilon:.3f}")
         except Exception as e:
+            # If we can't load the checkpoint, we start form the begining
             print(f"Erreur lors du chargement du checkpoint, l'entraînement repart de zéro. Erreur : {e}")
-            start_episode = 0 # repartir de zéro
+            start_episode = 0 
             rewards_per_episode = []
             losses_per_episode = []
     
-    if start_episode == 0: # Si on ne reprend pas, ou si la reprise a échoué
+    if start_episode == 0: 
         print("Début d'un nouvel entraînement. Préchauffage de la mémoire...")
-        WARMUP_STEPS = 100
+
+        # Define the number of initial random steps to take to fill the replay buffer
+        WARMUP_STEPS = 1000
         steps = 0
+
+        # Loop until the desired number of warmup steps is reached
         while steps < WARMUP_STEPS:
-            state, _ = env.reset()
-            done = False
+            state, _ = env.reset() # Reset the environment for a new trajectory
+            done = False # Flag indicating if the episode has ended
             while not done:
-                action = env.action_space.sample() # Action aléatoire
-                next_state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                agent.store_transition(state, action, reward, next_state, done)
+                action = env.action_space.sample() # choose a random action
+                next_state, reward, terminated, truncated, _ = env.step(action) # Take the random action in the environment
+                done = terminated or truncated # Check if the episode ended
+                agent.store_transition(state, action, reward, next_state, done) # Store the resulting transition in the agent's replay buffer
                 state = next_state
                 steps += 1
                 if steps >= WARMUP_STEPS:
                     break
     print(f"Mémoire préchauffée avec {len(agent.memory)} expériences.")
 
-    CHECKPOINT_FREQ = 50  # Sauvegarde tous les 100 épisodes
-    CHECKPOINT_PATH = "car_racing_checkpoint.pth"
+    # Checkpoint configuration
+    CHECKPOINT_FREQ = 50  # Save every 50 episodes
+    CHECKPOINT_PATH = "car_racing_checkpoint.pth" # Path to ssave the model
 
-    # Boucle d'entraînement principale
+    # Loop through episodes, starting from 'start_episode' up to (but not including) 'episodes'
     for episode in range(start_episode, episodes):
         state, _ = env.reset()
         total_reward = 0
@@ -341,31 +362,32 @@ def train_dqn(episodes=1000, render=False, learning_rate=1e-4, gamma=0.99,
         done = False
         
         while not done:
-            # 1. Choisir une action
+            # Choose an action
             action = agent.choose_action(state)
             
-            # 2. Agir dans l'environnement
+            # Interact with Environment: Take the chosen action in the environment
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             
-            # 3. Stocker l'expérience
+            # Store Experience: Store the transition (s, a, r, s', done) in the agent's replay buffer
             agent.store_transition(state, action, reward, next_state, done)
             
-            # 4. Entraîner l'agent (en échantillonnant un batch)
+            # Train Agent: Perform one training step by sampling a batch from the replay buffer.
             loss = agent.train_agent()
-            if loss is not None:
+            if loss is not None: # If training occurred (loss is not None), record the loss value
                 episode_losses.append(loss)
             
             state = next_state
             total_reward += reward
         
-        # 5. Décroissance d'epsilon à la fin de l'épisode
+        # Decay Epsilon: Decrease the exploration rate after the episode finishes
         agent.decay_epsilon()
         
         rewards_per_episode.append(total_reward)
         avg_loss = np.mean(episode_losses) if episode_losses else 0
         losses_per_episode.append(avg_loss)
         
+        # Every 10 episodesn we calculate the mean and do an update to the user with metrics
         if (episode + 1) % 10 == 0:
             avg_reward = np.mean(rewards_per_episode[-10:])
             print(f"Épisode {episode + 1}/{episodes} | "
@@ -373,30 +395,32 @@ def train_dqn(episodes=1000, render=False, learning_rate=1e-4, gamma=0.99,
                   f"Perte Moy: {avg_loss:.4f} | "
                   f"Epsilon: {agent.epsilon:.3f}")
             
+        # If checkpoint exists and episode is a multiple of checkpoint
         if (episode + 1) % CHECKPOINT_FREQ == 0 and checkpoint_path:
-            agent.save(CHECKPOINT_PATH) # Sauvegarde le modèle, l'optimizer et l'epsilon
+            agent.save(CHECKPOINT_PATH) # Save the complete agent state (model, optimizer, epsilon, step count)
             
-            # Sauvegarde les listes de métriques
+            # Save the metrics
             np.save(rewards_path, np.array(rewards_per_episode))
             np.save(losses_path, np.array(losses_per_episode))
             print(f"*** CHECKPOINT (Modèle + Métriques) SAUVEGARDÉ à l'épisode {episode + 1} ***")
             
-            # Enregistre la vidéo
+            # Record a video
             record_test_video(agent, episode_number=(episode + 1))
             
-            # Génère un graphique de progression
+            # Generate metrics and graphs and save them
             if plot_save_path:
                 plot_filename = plot_save_path.replace(".png", f"_ep{episode + 1}.png")
                 plot_training_results(rewards_per_episode, losses_per_episode, save_path=plot_filename)
     
-    env.close()
+    env.close() # Close the Gymnasium environment to release resources.
     print("=" * 60)
     print(f"Entraînement terminé pour LR={learning_rate}, Gamma={gamma}")
     
+    # Return the trained agent and the full history of rewards and losses.
     return agent, rewards_per_episode, losses_per_episode
 
 def plot_training_results(rewards, losses, save_path=None):
-    """Plot training metrics"""
+    """ Plot training metrics """
     fig, axes = plt.subplots(2, 2, figsize=(15, 10)) # Keep 'fig' variable
 
     # Plot 1: Raw rewards
@@ -446,51 +470,41 @@ def plot_training_results(rewards, losses, save_path=None):
 
     plt.tight_layout()
 
-    # --- CORRECTIONS HERE ---
+    # Saving or plotting the figure
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"Graphiques sauvegardés sous : {save_path}")
-        plt.close(fig) # <-- ADD THIS to close the figure after saving
+        plt.close(fig) # Close the figure to free memory but also to not block the training
     else:
         # If no save_path is given (only at the end), show the plot
         plt.savefig('ddqn_per_training_results.png', dpi=150, bbox_inches='tight')
         print("Training plots saved to 'ddqn_per_training_results.png'")
-        plt.show() # <-- KEEP plt.show() here for the final plot
-        plt.close(fig) # Good practice to close even after showing
-    # --- END OF CORRECTIONS ---
+        plt.show()
+        plt.close(fig)
 
 def record_test_video(agent, episode_number, video_folder_base='videos'):
     """
-    Crée un environnement de test temporaire, enregistre 1 vidéo de l'agent
-    en mode évaluation, puis ferme l'environnement.
+    Create a temporary test environment, record 1 video of the agent in evaluation mode, 
+    then close the environment.
     """
     print(f"\n--- Enregistrement vidéo de l'épisode {episode_number} ---")
     
-    # Crée un dossier unique pour cette sauvegarde vidéo (ex: 'videos/ep_100')
     video_folder = os.path.join(video_folder_base, f"ep_{episode_number}")
 
-    # 1. Créer l'environnement de test
     try:
-        # 'rgb_array' est requis pour que RecordVideo fonctionne
         test_env = gym.make('CarRacing-v3', continuous=False, render_mode='rgb_array')
-        
-        # 2. Wrapper pour la vidéo.
-        # Il crée le dossier 'video_folder' et enregistre
-        # uniquement le premier épisode (trigger=...e == 0)
         test_env = gym.wrappers.RecordVideo(test_env, 
                                            video_folder, 
                                            episode_trigger=lambda e: e == 0, 
                                            name_prefix=f"dqn-agent-ep{episode_number}") 
-        
-        # 3. Wrapper pour le preprocessing (très important !)
+
         test_env = PreprocessWrapper(test_env)
     except Exception as e:
         print(f"Erreur lors de la création de l'env de test vidéo : {e}")
         return
 
-    # Sauvegarde de l'epsilon actuel pour le restaurer après
     epsilon_backup = agent.epsilon
-    agent.epsilon = 0.0 # Mode Évaluation (pas d'actions aléatoires)
+    agent.epsilon = 0.0 
     
     state, _ = test_env.reset()
     done = False
@@ -505,31 +519,24 @@ def record_test_video(agent, episode_number, video_folder_base='videos'):
     
     print(f"Récompense du test vidéo : {total_reward:.2f}")
     
-    # 4. Fermer l'environnement (ceci finalise l'enregistrement de la vidéo)
     test_env.close()
     
-    # Restaurer l'epsilon d'entraînement
     agent.epsilon = epsilon_backup
     print(f"Vidéo de progression sauvegardée dans le dossier : {video_folder}")
 
 def test_agent_visually(model_path, episodes=5):
-    """
-    Charge un modèle sauvegardé et le lance en mode 'human' pour le regarder.
-    """
+    """ Load the model and run a few episodes in human render mode for visual inspection"""
     print(f"\n" + "="*70)
     print(f"TEST VISUEL du modèle : {model_path}")
     print(f"Lancement de {episodes} épisodes...")
     
-    # 1. Créer l'environnement en mode 'human'
     env = gym.make('CarRacing-v3', continuous=False, render_mode='human')
     env = PreprocessWrapper(env)
     
     action_size = env.action_space.n
     
-    # 2. Créer un nouvel agent
     agent = DQNAgent(action_size)
     
-    # 3. Charger les poids sauvegardés
     try:
         agent.load(model_path)
     except FileNotFoundError:
@@ -537,7 +544,6 @@ def test_agent_visually(model_path, episodes=5):
         env.close()
         return
 
-    # 4. Mettre l'agent en mode ÉVALUATION (plus d'exploration aléatoire)
     agent.epsilon = 0.0
     
     for episode in range(episodes):
@@ -546,13 +552,10 @@ def test_agent_visually(model_path, episodes=5):
         total_reward = 0
         
         while not done:
-            # Choisir l'action (meilleure action, car epsilon=0)
             action = agent.choose_action(state)
             
-            # Agir
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
-            
             state = next_state
             total_reward += reward
         
@@ -568,21 +571,19 @@ if __name__ == "__main__":
     # Defining final training parameters
     
     # Parameters based on hyperparameter search results
-    FINAL_LR = 0.001  # (1e-4)
+    FINAL_LR = 0.001 
     FINAL_GAMMA = 0.99
     
-    # Définissez le nombre total d'épisodes pour l'entraînement
-    # 2000 est un bon point de départ pour un "vrai" run
-    TOTAL_EPISODES = 1000
+    # Number of desired episodes for training
+    TOTAL_EPISODES = 1500
 
     # File to save the final model
     FINAL_MODEL_PATH = "model_final.pth"
-    CHECKPOINT_PATH = "car_racing_checkpoint.pth" # Le fichier pour la sauvegarde/reprise
+    CHECKPOINT_PATH = "car_racing_checkpoint.pth"
     PLOT_SAVE_PATH = "final_training_plot.png"
 
-    # Mettez-le à True si vous voulez reprendre un entraînement arrêté
+    # Choose if you want to start from the beginning or resume a training (True = resume)
     RESUME_TRAINING = True
-    # (Mettez True si le fichier car_racing_checkpoint.pth existe)
 
     print("=" * 70)
     print("DÉMARRAGE DE L'ENTRAÎNEMENT FINAL")
@@ -592,7 +593,7 @@ if __name__ == "__main__":
     print(f"Modèle sauvegardé sous: {FINAL_MODEL_PATH}")
     print("=" * 70)
 
-    # Mettre les seeds pour la reproductibilité
+    # Defining seeds for reproductability
     np.random.seed(42)
     torch.manual_seed(42)
     random.seed(42)
@@ -603,17 +604,16 @@ if __name__ == "__main__":
         render=False,      
         learning_rate=FINAL_LR,
         gamma=FINAL_GAMMA,
-        checkpoint_path=CHECKPOINT_PATH,  # Passe le chemin
-        plot_save_path=PLOT_SAVE_PATH,  # Passe le chemin
-        resume=RESUME_TRAINING          # Passe le booléen de reprise
+        checkpoint_path=CHECKPOINT_PATH,  
+        plot_save_path=PLOT_SAVE_PATH,  
+        resume=RESUME_TRAINING          
     )
 
-    # --- 3. Sauvegarder et analyser les résultats ---
     print("\n" + "=" * 70)
     print("Entraînement final terminé !")
     
     # Save the final model
-    agent.save(FINAL_MODEL_PATH)
+     agent.save(FINAL_MODEL_PATH)
     
     # Print final statistics
     print(f"\n{'='*70}")
@@ -631,13 +631,13 @@ if __name__ == "__main__":
     print(f"  Total steps trained: {agent.train_step_count}")
     print(f"  Buffer size: {len(agent.memory)}")
 
-    # Plot results
+    # # Plot results
     print("\nGenerating training plots...")
     plot_training_results(rewards, losses, save_path=PLOT_SAVE_PATH)
 
     # Visual terst of the final model
     print("\nStarting final visual test...")
-    test_agent_visually(FINAL_MODEL_PATH, episodes=3)
+    test_agent_visually(CHECKPOINT_PATH, episodes=3)
 
     
     
